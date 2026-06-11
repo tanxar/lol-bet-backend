@@ -1,6 +1,6 @@
 # Lol Bet Tracker — Node Server
 
-API server χωρίς εξωτερικές εξαρτήσεις — χρειάζεται μόνο Node.js 18+.
+API server για sync και ιστορικό αγώνων — Node.js 18+ και PostgreSQL (Render) ή JSON τοπικά.
 
 ## Γρήγορη εκκίνηση
 
@@ -36,6 +36,7 @@ Health check: `http://localhost:5080/health`
 |--------|------|-----------|
 | GET | `/health` | Έλεγχος ότι τρέχει |
 | POST | `/api/matches` | Καταχώρηση αγώνα |
+| GET | `/api/matches?completed=true` | Λίστα ολοκληρωμένων αγώνων (για History tab) |
 | GET | `/api/matches` | Λίστα αγώνων |
 | GET | `/api/matches/:id` | Λεπτομέρειες |
 | GET | `/api/matches/:id?format=raw` | Αρχικό JSON |
@@ -75,10 +76,13 @@ X-Api-Key: your-secret-key
 4. Ρυθμίσεις (αν δεν χρησιμοποιείς Blueprint):
    - **Build Command:** *(κενό)*
    - **Start Command:** `node src/index.js`
-5. **Environment → Add:**
+5. **New → PostgreSQL** στο ίδιο project (ή υπάρχον DB) — Render δημιουργεί αυτόματα `DATABASE_URL`.
+6. Στο **Web Service → Environment → Add:**
    - `API_KEY` = μυστικό κλειδί (π.χ. `my-secret-key-123`)
    - `HOST` = `0.0.0.0`
-6. Deploy → URL π.χ. `https://lol-bet-tracker-server.onrender.com`
+   - `DATABASE_URL` = *(από το linked PostgreSQL — συνήθως γίνεται αυτόματα)*
+7. **Build Command:** `npm install`
+8. Deploy → URL π.χ. `https://lol-bet-tracker-server.onrender.com`
 
 Έλεγχος: `https://YOUR-APP.onrender.com/health`
 
@@ -117,4 +121,8 @@ Firewall: `sudo ufw allow 5080/tcp`
 
 ## Δεδομένα
 
-`data/store.json` (φάκελος `DATA_DIR`)
+**Production (Render):** PostgreSQL — πίνακας `matches` δημιουργείται αυτόματα στην εκκίνηση.
+
+**Τοπικά (χωρίς DATABASE_URL):** `data/store.json` (φάκελος `DATA_DIR`).
+
+Έλεγχος DB: `GET /health` → `{ "database": { "ok": true, "mode": "postgres" } }`

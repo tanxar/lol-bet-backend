@@ -34,5 +34,6 @@ module.exports = {
   port: parseInt(process.env.PORT, 10) || 5080,
   host: process.env.HOST || '0.0.0.0',
   apiKey: process.env.API_KEY || '',
-  dataDir: process.env.DATA_DIR || './data'
+  dataDir: process.env.DATA_DIR || './data',
+  databaseUrl: process.env.DATABASE_URL || ''
 };

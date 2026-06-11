@@ -1,7 +1,7 @@
 {
   "name": "lol-bet-tracker-server",
   "version": "1.0.0",
-  "description": "API server for Lol Bet Tracker match sync (zero npm dependencies)",
+  "description": "API server for Lol Bet Tracker match sync and history (PostgreSQL on Render)",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
@@ -9,5 +9,8 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
   }
 }

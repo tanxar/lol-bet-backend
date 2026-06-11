@@ -1,13 +1,9 @@
-# Αν το repo είναι: lol-bet-backend/server/... → βάλε αυτό το αρχείο στο ROOT του GitHub repo
-# (δηλαδή lol-bet-backend/render.yaml, ΟΧΙ μέσα στον φάκελο server)
-
 services:
   - type: web
     name: lol-bet-tracker-server
     runtime: node
     plan: free
-    rootDir: server
-    buildCommand: ""
+    buildCommand: npm install
     startCommand: node src/index.js
     healthCheckPath: /health
     envVars:
