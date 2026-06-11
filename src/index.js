@@ -8,6 +8,14 @@ const {
   getMatchDetails,
   checkDatabaseHealth
 } = require('./db');
+const {
+  createProposal,
+  getProposal,
+  respondToProposal,
+  getActiveProposalForMatch,
+  getPendingInvitationForSummoner,
+  validateProposalCreate
+} = require('./betProposals');
 const { readJsonBody, sendJson, parseUrl } = require('./http');
 
 let db;
@@ -132,6 +140,129 @@ async function handleRequest(req, res) {
       } catch (err) {
         console.error('Failed to get match:', err);
         sendJson(res, 500, { error: 'Failed to get match' });
+      }
+      return;
+    }
+  }
+
+  if (pathname.startsWith('/api/bet-proposals')) {
+    if (!checkApiKey(req, res)) return;
+
+    if (req.method === 'POST' && pathname === '/api/bet-proposals') {
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        sendJson(res, 400, { error: err.message === 'Body too large' ? 'Body too large' : 'Invalid JSON body' });
+        return;
+      }
+
+      const errors = validateProposalCreate(body);
+      if (errors.length > 0) {
+        sendJson(res, 400, { error: 'Validation failed', details: errors });
+        return;
+      }
+
+      try {
+        const proposal = await createProposal(db, body);
+        sendJson(res, 201, proposal);
+      } catch (err) {
+        console.error('Failed to create bet proposal:', err);
+        sendJson(res, 500, { error: 'Failed to create bet proposal' });
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/bet-proposals/active') {
+      const matchSessionId = url.searchParams.get('matchSessionId');
+      if (!matchSessionId) {
+        sendJson(res, 400, { error: 'matchSessionId is required' });
+        return;
+      }
+
+      try {
+        const proposal = await getActiveProposalForMatch(db, matchSessionId);
+        if (!proposal) {
+          sendJson(res, 404, { error: 'No active proposal' });
+          return;
+        }
+        sendJson(res, 200, proposal);
+      } catch (err) {
+        console.error('Failed to get active proposal:', err);
+        sendJson(res, 500, { error: 'Failed to get active proposal' });
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/bet-proposals/invitation') {
+      const summoner = url.searchParams.get('summoner');
+      if (!summoner) {
+        sendJson(res, 400, { error: 'summoner is required' });
+        return;
+      }
+
+      try {
+        const proposal = await getPendingInvitationForSummoner(db, summoner);
+        if (!proposal) {
+          sendJson(res, 404, { error: 'No pending invitation' });
+          return;
+        }
+        sendJson(res, 200, proposal);
+      } catch (err) {
+        console.error('Failed to get invitation:', err);
+        sendJson(res, 500, { error: 'Failed to get invitation' });
+      }
+      return;
+    }
+
+    const proposalActionMatch = pathname.match(/^\/api\/bet-proposals\/([^/]+)\/(accept|decline)$/);
+    if (req.method === 'POST' && proposalActionMatch) {
+      const proposalId = decodeURIComponent(proposalActionMatch[1]);
+      const action = proposalActionMatch[2];
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        sendJson(res, 400, { error: 'Invalid JSON body' });
+        return;
+      }
+
+      if (!body?.summoner) {
+        sendJson(res, 400, { error: 'summoner is required' });
+        return;
+      }
+
+      try {
+        const proposal = await respondToProposal(db, proposalId, body.summoner, action === 'accept' ? 'accept' : 'decline');
+        if (!proposal) {
+          sendJson(res, 404, { error: 'Proposal not found' });
+          return;
+        }
+        sendJson(res, 200, proposal);
+      } catch (err) {
+        if (err.code === 'NOT_PARTICIPANT') {
+          sendJson(res, 403, { error: err.message });
+          return;
+        }
+        console.error('Failed to respond to proposal:', err);
+        sendJson(res, 500, { error: 'Failed to respond to proposal' });
+      }
+      return;
+    }
+
+    const proposalDetailMatch = pathname.match(/^\/api\/bet-proposals\/([^/]+)$/);
+    if (req.method === 'GET' && proposalDetailMatch) {
+      const proposalId = decodeURIComponent(proposalDetailMatch[1]);
+      try {
+        const proposal = await getProposal(db, proposalId);
+        if (!proposal) {
+          sendJson(res, 404, { error: 'Proposal not found' });
+          return;
+        }
+        sendJson(res, 200, proposal);
+      } catch (err) {
+        console.error('Failed to get proposal:', err);
+        sendJson(res, 500, { error: 'Failed to get proposal' });
       }
       return;
     }
