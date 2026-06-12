@@ -160,6 +160,50 @@ function rebuildPlayers(players, selfTeams, peerTeams, lobbyOwnerSummoner) {
   });
 }
 
+function pickCanonicalRoster(existing, body, lobbyOwnerSummoner, reporter) {
+  const incoming = body.players ?? [];
+  const stored = existing?.players ?? [];
+  if (!stored.length) return incoming;
+  if (!incoming.length) return stored;
+
+  const ownerKey = normalizeSummoner(lobbyOwnerSummoner);
+  if (ownerKey && reporter === ownerKey) return incoming;
+  if (ownerKey && reporter !== ownerKey) return mergeRosterPreservingOrder(stored, incoming);
+
+  return incoming.length >= stored.length ? incoming : stored;
+}
+
+function mergeRosterPreservingOrder(stored, incoming) {
+  const incomingByKey = new Map();
+  for (const player of incoming) {
+    incomingByKey.set(playerKey(player), player);
+  }
+
+  const used = new Set();
+  const merged = stored.map((player) => {
+    const key = playerKey(player);
+    used.add(key);
+    const update = incomingByKey.get(key);
+    if (!update) return player;
+
+    return {
+      ...player,
+      ...update,
+      team: isRosterTeam(update.team) ? update.team : player.team,
+      championId: update.championId || player.championId
+    };
+  });
+
+  for (const player of incoming) {
+    const key = playerKey(player);
+    if (!used.has(key)) {
+      merged.push(player);
+    }
+  }
+
+  return merged;
+}
+
 function mergeLobbyReport(existing, body) {
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + LOBBY_TTL_MS).toISOString();
@@ -197,8 +241,9 @@ function mergeLobbyReport(existing, body) {
   }
 
   reconcileDualHumanSelfTeams(selfTeams, peerTeams, lobbyOwnerSummoner);
+  const rosterSource = pickCanonicalRoster(existing, body, lobbyOwnerSummoner, reporter);
   const players = rebuildPlayers(
-    body.players ?? existing?.players ?? [],
+    rosterSource,
     selfTeams,
     peerTeams,
     lobbyOwnerSummoner
