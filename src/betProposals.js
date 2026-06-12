@@ -67,8 +67,18 @@ async function ensureProposalSchema(db) {
   db.writeStore(store);
 }
 
-async function createProposal(db, body) {
+async function createProposal(db, body, options = {}) {
   await ensureProposalSchema(db);
+
+  if (options.getLobby) {
+    const lobby = await options.getLobby(db, body.matchSessionId);
+    if (lobby?.lobbyOwnerSummoner &&
+      normalizeSummoner(lobby.lobbyOwnerSummoner) !== normalizeSummoner(body.creatorSummoner)) {
+      const err = new Error('Only the lobby owner can create bet proposals');
+      err.code = 'NOT_LOBBY_OWNER';
+      throw err;
+    }
+  }
 
   const proposalId = body.proposalId || `bp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const requiredParticipants = (body.requiredParticipants ?? []).map((p) => String(p).trim());

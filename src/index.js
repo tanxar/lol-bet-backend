@@ -20,6 +20,13 @@ const {
   expireProposalsForMatch,
   validateProposalCreate
 } = require('./betProposals');
+const {
+  resolveLobby,
+  upsertLobby,
+  getLobby,
+  deleteLobby,
+  validateLobbySync
+} = require('./lobbies');
 const { readJsonBody, sendJson, parseUrl, sendFile } = require('./http');
 
 const updatesDir = path.join(__dirname, '..', 'updates');
@@ -192,9 +199,13 @@ async function handleRequest(req, res) {
       }
 
       try {
-        const proposal = await createProposal(db, body);
+        const proposal = await createProposal(db, body, { getLobby });
         sendJson(res, 201, proposal);
       } catch (err) {
+        if (err.code === 'NOT_LOBBY_OWNER') {
+          sendJson(res, 403, { error: err.message });
+          return;
+        }
         console.error('Failed to create bet proposal:', err);
         sendJson(res, 500, { error: 'Failed to create bet proposal' });
       }
@@ -329,6 +340,100 @@ async function handleRequest(req, res) {
         sendJson(res, 500, { error: 'Failed to get proposal' });
       }
       return;
+    }
+  }
+
+  if (pathname.startsWith('/api/lobbies')) {
+    if (!checkApiKey(req, res)) return;
+
+    if (req.method === 'POST' && pathname === '/api/lobbies/resolve') {
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        sendJson(res, 400, { error: err.message === 'Body too large' ? 'Body too large' : 'Invalid JSON body' });
+        return;
+      }
+
+      const errors = validateLobbySync(body);
+      if (errors.length > 0) {
+        sendJson(res, 400, { error: 'Validation failed', details: errors });
+        return;
+      }
+
+      try {
+        const lobby = await resolveLobby(db, body);
+        sendJson(res, 200, lobby);
+      } catch (err) {
+        if (err.code === 'VALIDATION') {
+          sendJson(res, 400, { error: err.message });
+          return;
+        }
+        console.error('Failed to resolve lobby:', err);
+        sendJson(res, 500, { error: 'Failed to resolve lobby' });
+      }
+      return;
+    }
+
+    const lobbyDetailMatch = pathname.match(/^\/api\/lobbies\/([^/]+)$/);
+    if (lobbyDetailMatch) {
+      const matchSessionId = decodeURIComponent(lobbyDetailMatch[1]);
+
+      if (req.method === 'GET') {
+        try {
+          const lobby = await getLobby(db, matchSessionId);
+          if (!lobby) {
+            sendJson(res, 404, { error: 'Lobby not found' });
+            return;
+          }
+          sendJson(res, 200, lobby);
+        } catch (err) {
+          console.error('Failed to get lobby:', err);
+          sendJson(res, 500, { error: 'Failed to get lobby' });
+        }
+        return;
+      }
+
+      if (req.method === 'PUT') {
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch (err) {
+          sendJson(res, 400, { error: 'Invalid JSON body' });
+          return;
+        }
+
+        const errors = validateLobbySync(body);
+        if (errors.length > 0) {
+          sendJson(res, 400, { error: 'Validation failed', details: errors });
+          return;
+        }
+
+        try {
+          const lobby = await upsertLobby(db, { ...body, matchSessionId });
+          sendJson(res, 200, lobby);
+        } catch (err) {
+          console.error('Failed to upsert lobby:', err);
+          sendJson(res, 500, { error: 'Failed to upsert lobby' });
+        }
+        return;
+      }
+
+      if (req.method === 'DELETE') {
+        try {
+          const deleted = await deleteLobby(db, matchSessionId);
+          if (!deleted) {
+            sendJson(res, 404, { error: 'Lobby not found' });
+            return;
+          }
+          res.writeHead(204);
+          res.end();
+        } catch (err) {
+          console.error('Failed to delete lobby:', err);
+          sendJson(res, 500, { error: 'Failed to delete lobby' });
+        }
+        return;
+      }
     }
   }
 
