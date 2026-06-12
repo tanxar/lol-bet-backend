@@ -85,8 +85,48 @@ function isExpired(lobby) {
   return Date.parse(lobby.expiresAt) <= Date.now();
 }
 
-function reconcileDualHumanSelfTeams(selfTeams, peerTeams) {
+function resolveHumanTeam(key, selfTeams, peerTeams, lobbyOwnerSummoner) {
+  const ownerKey = normalizeSummoner(lobbyOwnerSummoner);
+  const ownerTeam = ownerKey ? selfTeams?.[ownerKey]?.team : null;
+
+  if (ownerKey && key === ownerKey && isRosterTeam(ownerTeam)) {
+    return ownerTeam;
+  }
+
+  if (ownerKey && isRosterTeam(ownerTeam) && key !== ownerKey) {
+    const selfTeam = selfTeams?.[key]?.team;
+    if (isRosterTeam(selfTeam) && selfTeam !== ownerTeam) return selfTeam;
+
+    const peerTeam = peerTeams?.[key];
+    if (isRosterTeam(peerTeam) && peerTeam !== ownerTeam) return peerTeam;
+
+    return ownerTeam === 'BLUE' ? 'RED' : 'BLUE';
+  }
+
+  if (isRosterTeam(selfTeams?.[key]?.team)) return selfTeams[key].team;
+  if (isRosterTeam(peerTeams?.[key])) return peerTeams[key];
+  return null;
+}
+
+function reconcileDualHumanSelfTeams(selfTeams, peerTeams, lobbyOwnerSummoner) {
   const keys = Object.keys(selfTeams ?? {}).filter((key) => isRosterTeam(selfTeams[key]?.team));
+  if (keys.length === 0) return;
+
+  const ownerKey = normalizeSummoner(lobbyOwnerSummoner);
+  if (ownerKey && isRosterTeam(selfTeams[ownerKey]?.team)) {
+    const ownerTeam = selfTeams[ownerKey].team;
+    for (const key of keys) {
+      if (key === ownerKey) continue;
+      if (selfTeams[key].team === ownerTeam) {
+        selfTeams[key] = {
+          ...selfTeams[key],
+          team: resolveHumanTeam(key, selfTeams, peerTeams, lobbyOwnerSummoner)
+        };
+      }
+    }
+    return;
+  }
+
   if (keys.length !== 2) return;
 
   const [a, b] = keys;
@@ -109,13 +149,14 @@ function reconcileDualHumanSelfTeams(selfTeams, peerTeams) {
   selfTeams[b] = { ...selfTeams[b], team: teamA === 'BLUE' ? 'RED' : 'BLUE' };
 }
 
-function rebuildPlayers(players, selfTeams, peerTeams) {
+function rebuildPlayers(players, selfTeams, peerTeams, lobbyOwnerSummoner) {
   return (players ?? []).map((player) => {
     if (player.isBot) return player;
 
     const key = normalizeSummoner(player.summonerName);
-    const team = selfTeams?.[key]?.team ?? peerTeams?.[key] ?? player.team;
-    return { ...player, team };
+    const team = resolveHumanTeam(key, selfTeams, peerTeams, lobbyOwnerSummoner)
+      ?? player.team;
+    return isRosterTeam(team) ? { ...player, team } : player;
   });
 }
 
@@ -155,8 +196,13 @@ function mergeLobbyReport(existing, body) {
     }
   }
 
-  reconcileDualHumanSelfTeams(selfTeams, peerTeams);
-  const players = rebuildPlayers(body.players ?? existing?.players ?? [], selfTeams, peerTeams);
+  reconcileDualHumanSelfTeams(selfTeams, peerTeams, lobbyOwnerSummoner);
+  const players = rebuildPlayers(
+    body.players ?? existing?.players ?? [],
+    selfTeams,
+    peerTeams,
+    lobbyOwnerSummoner
+  );
 
   return {
     matchSessionId: body.matchSessionId ?? existing?.matchSessionId,
