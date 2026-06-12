@@ -45,8 +45,25 @@ function parseUrl(req) {
   return new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 }
 
+function sendFile(res, statusCode, filePath, contentType) {
+  const fs = require('fs');
+  const stream = fs.createReadStream(filePath);
+
+  stream.on('open', () => {
+    res.writeHead(statusCode, { 'Content-Type': contentType });
+    stream.pipe(res);
+  });
+
+  stream.on('error', () => {
+    if (!res.headersSent) {
+      sendJson(res, 404, { error: 'File not found' });
+    }
+  });
+}
+
 module.exports = {
   readJsonBody,
   sendJson,
-  parseUrl
+  parseUrl,
+  sendFile
 };

@@ -1,4 +1,6 @@
+const fs = require('fs');
 const http = require('http');
+const path = require('path');
 const config = require('./config');
 const {
   openDatabase,
@@ -14,9 +16,13 @@ const {
   respondToProposal,
   getActiveProposalForMatch,
   getPendingInvitationForSummoner,
+  cancelProposal,
+  expireProposalsForMatch,
   validateProposalCreate
 } = require('./betProposals');
-const { readJsonBody, sendJson, parseUrl } = require('./http');
+const { readJsonBody, sendJson, parseUrl, sendFile } = require('./http');
+
+const updatesDir = path.join(__dirname, '..', 'updates');
 
 let db;
 
@@ -52,6 +58,28 @@ async function handleRequest(req, res) {
   const url = parseUrl(req);
   const pathname = url.pathname;
   logRequest(req, pathname);
+
+  if (req.method === 'GET' && pathname === '/updates/version.json') {
+    const versionPath = path.join(updatesDir, 'version.json');
+    if (!fs.existsSync(versionPath)) {
+      sendJson(res, 404, { error: 'version.json not deployed' });
+      return;
+    }
+
+    sendFile(res, 200, versionPath, 'application/json; charset=utf-8');
+    return;
+  }
+
+  if (req.method === 'GET' && pathname === '/updates/LolBetTracker.exe') {
+    const exePath = path.join(updatesDir, 'LolBetTracker.exe');
+    if (!fs.existsSync(exePath)) {
+      sendJson(res, 404, { error: 'LolBetTracker.exe not deployed' });
+      return;
+    }
+
+    sendFile(res, 200, exePath, 'application/octet-stream');
+    return;
+  }
 
   if (req.method === 'GET' && pathname === '/health') {
     try {
@@ -194,6 +222,30 @@ async function handleRequest(req, res) {
       return;
     }
 
+    if (req.method === 'POST' && pathname === '/api/bet-proposals/expire') {
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (err) {
+        sendJson(res, 400, { error: 'Invalid JSON body' });
+        return;
+      }
+
+      if (!body?.matchSessionId) {
+        sendJson(res, 400, { error: 'matchSessionId is required' });
+        return;
+      }
+
+      try {
+        const expired = await expireProposalsForMatch(db, body.matchSessionId);
+        sendJson(res, 200, { expired });
+      } catch (err) {
+        console.error('Failed to expire proposals:', err);
+        sendJson(res, 500, { error: 'Failed to expire proposals' });
+      }
+      return;
+    }
+
     if (req.method === 'GET' && pathname === '/api/bet-proposals/invitation') {
       const summoner = url.searchParams.get('summoner');
       if (!summoner) {
@@ -201,8 +253,10 @@ async function handleRequest(req, res) {
         return;
       }
 
+      const matchSessionId = url.searchParams.get('matchSessionId');
+
       try {
-        const proposal = await getPendingInvitationForSummoner(db, summoner);
+        const proposal = await getPendingInvitationForSummoner(db, summoner, matchSessionId);
         if (!proposal) {
           sendJson(res, 404, { error: 'No pending invitation' });
           return;
@@ -215,7 +269,7 @@ async function handleRequest(req, res) {
       return;
     }
 
-    const proposalActionMatch = pathname.match(/^\/api\/bet-proposals\/([^/]+)\/(accept|decline)$/);
+    const proposalActionMatch = pathname.match(/^\/api\/bet-proposals\/([^/]+)\/(accept|decline|cancel)$/);
     if (req.method === 'POST' && proposalActionMatch) {
       const proposalId = decodeURIComponent(proposalActionMatch[1]);
       const action = proposalActionMatch[2];
@@ -233,15 +287,25 @@ async function handleRequest(req, res) {
       }
 
       try {
-        const proposal = await respondToProposal(db, proposalId, body.summoner, action === 'accept' ? 'accept' : 'decline');
+        let proposal;
+        if (action === 'cancel') {
+          proposal = await cancelProposal(db, proposalId, body.summoner);
+        } else {
+          proposal = await respondToProposal(db, proposalId, body.summoner, action === 'accept' ? 'accept' : 'decline');
+        }
+
         if (!proposal) {
           sendJson(res, 404, { error: 'Proposal not found' });
           return;
         }
         sendJson(res, 200, proposal);
       } catch (err) {
-        if (err.code === 'NOT_PARTICIPANT') {
+        if (err.code === 'NOT_PARTICIPANT' || err.code === 'NOT_CREATOR') {
           sendJson(res, 403, { error: err.message });
+          return;
+        }
+        if (err.code === 'PROPOSAL_NOT_PENDING') {
+          sendJson(res, 409, { error: err.message });
           return;
         }
         console.error('Failed to respond to proposal:', err);

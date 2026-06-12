@@ -160,9 +160,11 @@ async function getProposal(db, proposalId) {
   return store.betProposals?.[proposalId] ?? null;
 }
 
-async function saveProposalRecord(db, record) {
+async function saveProposalRecord(db, record, options = {}) {
   record.updatedAt = new Date().toISOString();
-  record.status = evaluateStatus(record.requiredParticipants, record.responses);
+  if (!options.forceStatus) {
+    record.status = evaluateStatus(record.requiredParticipants, record.responses);
+  }
 
   if (db.mode === 'postgres') {
     await db.pool.query(
@@ -186,7 +188,11 @@ async function saveProposalRecord(db, record) {
 async function respondToProposal(db, proposalId, summoner, decision) {
   const proposal = await getProposal(db, proposalId);
   if (!proposal) return null;
-  if (proposal.status !== 'pending') return proposal;
+  if (proposal.status !== 'pending') {
+    const err = new Error('Proposal is no longer pending');
+    err.code = 'PROPOSAL_NOT_PENDING';
+    throw err;
+  }
 
   const normalized = normalizeSummoner(summoner);
   const required = new Set((proposal.requiredParticipants ?? []).map(normalizeSummoner));
@@ -239,11 +245,9 @@ async function getActiveProposalForMatch(db, matchSessionId) {
     .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))[0] ?? null;
 }
 
-async function getPendingInvitationForSummoner(db, summoner) {
+async function listPendingProposalsForMatch(db, matchSessionId) {
   await ensureProposalSchema(db);
-  const normalized = normalizeSummoner(summoner);
 
-  let proposals = [];
   if (db.mode === 'postgres') {
     const result = await db.pool.query(
       `
@@ -251,14 +255,89 @@ async function getPendingInvitationForSummoner(db, summoner) {
              picked_team, target_value, stake_description, required_participants,
              responses, status, created_at, updated_at
       FROM bet_proposals
-      WHERE status = 'pending'
+      WHERE match_session_id = $1 AND status = 'pending'
       ORDER BY created_at DESC
-      `
+      `,
+      [matchSessionId]
     );
+    return result.rows.map(mapProposalRow);
+  }
+
+  const store = db.readStore();
+  return Object.values(store.betProposals ?? {})
+    .filter((p) => p.matchSessionId === matchSessionId && p.status === 'pending');
+}
+
+async function cancelProposal(db, proposalId, summoner) {
+  const proposal = await getProposal(db, proposalId);
+  if (!proposal) return null;
+
+  if (proposal.status !== 'pending') {
+    const err = new Error('Proposal is no longer pending');
+    err.code = 'PROPOSAL_NOT_PENDING';
+    throw err;
+  }
+
+  if (normalizeSummoner(proposal.creatorSummoner) !== normalizeSummoner(summoner)) {
+    const err = new Error('Only the creator can cancel this proposal');
+    err.code = 'NOT_CREATOR';
+    throw err;
+  }
+
+  proposal.status = 'cancelled';
+  return saveProposalRecord(db, proposal, { forceStatus: true });
+}
+
+async function expireProposalsForMatch(db, matchSessionId) {
+  if (!matchSessionId) return [];
+
+  const pending = await listPendingProposalsForMatch(db, matchSessionId);
+  const expired = [];
+
+  for (const proposal of pending) {
+    proposal.status = 'expired';
+    expired.push(await saveProposalRecord(db, proposal, { forceStatus: true }));
+  }
+
+  return expired;
+}
+
+async function getPendingInvitationForSummoner(db, summoner, matchSessionId = null) {
+  await ensureProposalSchema(db);
+  const normalized = normalizeSummoner(summoner);
+
+  let proposals = [];
+  if (db.mode === 'postgres') {
+    const result = matchSessionId
+      ? await db.pool.query(
+        `
+        SELECT proposal_id, match_session_id, creator_summoner, stake_amount, rule_type,
+               picked_team, target_value, stake_description, required_participants,
+               responses, status, created_at, updated_at
+        FROM bet_proposals
+        WHERE status = 'pending' AND match_session_id = $1
+        ORDER BY created_at DESC
+        `,
+        [matchSessionId]
+      )
+      : await db.pool.query(
+        `
+        SELECT proposal_id, match_session_id, creator_summoner, stake_amount, rule_type,
+               picked_team, target_value, stake_description, required_participants,
+               responses, status, created_at, updated_at
+        FROM bet_proposals
+        WHERE status = 'pending'
+        ORDER BY created_at DESC
+        `
+      );
     proposals = result.rows.map(mapProposalRow);
   } else {
     const store = db.readStore();
-    proposals = Object.values(store.betProposals ?? {}).filter((p) => p.status === 'pending');
+    proposals = Object.values(store.betProposals ?? {}).filter((p) => {
+      if (p.status !== 'pending') return false;
+      if (matchSessionId && p.matchSessionId !== matchSessionId) return false;
+      return true;
+    });
   }
 
   return proposals.find((proposal) => {
@@ -289,5 +368,7 @@ module.exports = {
   respondToProposal,
   getActiveProposalForMatch,
   getPendingInvitationForSummoner,
+  cancelProposal,
+  expireProposalsForMatch,
   validateProposalCreate
 };
