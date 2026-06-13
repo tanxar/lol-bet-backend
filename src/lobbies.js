@@ -85,76 +85,22 @@ function isExpired(lobby) {
   return Date.parse(lobby.expiresAt) <= Date.now();
 }
 
-function resolveHumanTeam(key, selfTeams, peerTeams, lobbyOwnerSummoner) {
-  const ownerKey = normalizeSummoner(lobbyOwnerSummoner);
-  const ownerTeam = ownerKey ? selfTeams?.[ownerKey]?.team : null;
-
-  if (ownerKey && key === ownerKey && isRosterTeam(ownerTeam)) {
-    return ownerTeam;
-  }
-
-  if (ownerKey && isRosterTeam(ownerTeam) && key !== ownerKey) {
-    const selfTeam = selfTeams?.[key]?.team;
-    if (isRosterTeam(selfTeam) && selfTeam !== ownerTeam) return selfTeam;
-
-    const peerTeam = peerTeams?.[key];
-    if (isRosterTeam(peerTeam) && peerTeam !== ownerTeam) return peerTeam;
-
-    return ownerTeam === 'BLUE' ? 'RED' : 'BLUE';
-  }
-
+function resolveHumanTeam(key, selfTeams, peerTeams) {
   if (isRosterTeam(selfTeams?.[key]?.team)) return selfTeams[key].team;
   if (isRosterTeam(peerTeams?.[key])) return peerTeams[key];
   return null;
 }
 
-function reconcileDualHumanSelfTeams(selfTeams, peerTeams, lobbyOwnerSummoner) {
-  const keys = Object.keys(selfTeams ?? {}).filter((key) => isRosterTeam(selfTeams[key]?.team));
-  if (keys.length === 0) return;
-
-  const ownerKey = normalizeSummoner(lobbyOwnerSummoner);
-  if (ownerKey && isRosterTeam(selfTeams[ownerKey]?.team)) {
-    const ownerTeam = selfTeams[ownerKey].team;
-    for (const key of keys) {
-      if (key === ownerKey) continue;
-      if (selfTeams[key].team === ownerTeam) {
-        selfTeams[key] = {
-          ...selfTeams[key],
-          team: resolveHumanTeam(key, selfTeams, peerTeams, lobbyOwnerSummoner)
-        };
-      }
-    }
-    return;
-  }
-
-  if (keys.length !== 2) return;
-
-  const [a, b] = keys;
-  const teamA = selfTeams[a].team;
-  const teamB = selfTeams[b].team;
-  if (teamA !== teamB) return;
-
-  const peerB = peerTeams?.[b];
-  const peerA = peerTeams?.[a];
-  if (isRosterTeam(peerB) && peerB !== teamA) {
-    selfTeams[b] = { ...selfTeams[b], team: peerB };
-    return;
-  }
-
-  if (isRosterTeam(peerA) && peerA !== teamB) {
-    selfTeams[a] = { ...selfTeams[a], team: peerA };
-    return;
-  }
-
-  selfTeams[b] = { ...selfTeams[b], team: teamA === 'BLUE' ? 'RED' : 'BLUE' };
+function reconcileDualHumanSelfTeams(_selfTeams, _peerTeams, _lobbyOwnerSummoner) {
+  // Each client reports only their own side. Same-side custom lobbies stay together.
 }
 
-function rebuildPlayers(players, selfTeams, peerTeams, lobbyOwnerSummoner) {
+function rebuildPlayers(players, selfTeams, peerTeams) {
   return (players ?? []).map((player) => {
     if (player.isBot) return player;
 
     const key = normalizeSummoner(player.summonerName);
-    const team = resolveHumanTeam(key, selfTeams, peerTeams, lobbyOwnerSummoner)
+    const team = resolveHumanTeam(key, selfTeams, peerTeams)
       ?? player.team;
     return isRosterTeam(team) ? { ...player, team } : player;
   });
@@ -245,8 +191,7 @@ function mergeLobbyReport(existing, body) {
   const players = rebuildPlayers(
     rosterSource,
     selfTeams,
-    peerTeams,
-    lobbyOwnerSummoner
+    peerTeams
   );
 
   return {
