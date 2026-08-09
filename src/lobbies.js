@@ -1,6 +1,9 @@
 const crypto = require('crypto');
+const { listStakeLocks, toPublicStakeLocks } = require('./stakeLocks');
 
 const LOBBY_TTL_MS = 3 * 60 * 60 * 1000;
+
+const { recordClientReport } = require('./lobbyValidation');
 
 function normalizeSummoner(value) {
   return String(value ?? '').trim().toUpperCase();
@@ -47,6 +50,8 @@ function mapLobbyRow(row) {
     players: row.players ?? [],
     selfTeams: row.self_teams ?? row.selfTeams ?? {},
     peerTeams: row.peer_teams ?? row.peerTeams ?? {},
+    clientReports: row.client_reports ?? row.clientReports ?? {},
+    validation: row.validation ?? null,
     updatedAt: row.updated_at?.toISOString?.() ?? row.updatedAt,
     expiresAt: row.expires_at?.toISOString?.() ?? row.expiresAt
   };
@@ -65,6 +70,8 @@ async function ensureLobbySchema(db) {
         players JSONB NOT NULL DEFAULT '[]'::jsonb,
         self_teams JSONB NOT NULL DEFAULT '{}'::jsonb,
         peer_teams JSONB NOT NULL DEFAULT '{}'::jsonb,
+        client_reports JSONB NOT NULL DEFAULT '{}'::jsonb,
+        validation JSONB,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         expires_at TIMESTAMPTZ NOT NULL
       );
@@ -150,25 +157,58 @@ function mergeRosterPreservingOrder(stored, incoming) {
   return merged;
 }
 
+function normalizePlayerLeadership(players, lobbyOwnerSummoner) {
+  const ownerKey = normalizeSummoner(lobbyOwnerSummoner);
+  if (!ownerKey) return players ?? [];
+
+  return (players ?? []).map((player) => ({
+    ...player,
+    isLeader: !player.isBot &&
+      normalizeSummoner(player.summonerName) === ownerKey
+  }));
+}
+
+function readOwnerFromLobbyName(lobbyName, players) {
+  const trimmed = String(lobbyName ?? '').trim();
+  if (!trimmed) return null;
+
+  const match = /^(.+?)['’]S\s+/i.exec(trimmed);
+  if (!match) return null;
+
+  const prefix = match[1].trim().toUpperCase();
+  for (const player of players ?? []) {
+    if (player.isBot) continue;
+
+    const name = String(player.summonerName ?? '').trim();
+    if (!name) continue;
+
+    const gameName = name.split('#')[0].trim().toUpperCase();
+    if (gameName === prefix) return player.summonerName;
+  }
+
+  return null;
+}
+
+function mergeLobbyOwner(existingOwner, body, _reporter) {
+  if (isResolvableSummoner(existingOwner)) {
+    return existingOwner;
+  }
+
+  const connected = body.connectedSummoner ?? body.ConnectedSummoner ?? null;
+  if (isResolvableSummoner(connected)) {
+    return String(connected).trim();
+  }
+
+  return null;
+}
+
 function mergeLobbyReport(existing, body) {
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + LOBBY_TTL_MS).toISOString();
   const reporter = normalizeSummoner(body.connectedSummoner);
   const selfTeams = { ...(existing?.selfTeams ?? {}) };
   const peerTeams = { ...(existing?.peerTeams ?? {}) };
-  let lobbyOwnerSummoner = existing?.lobbyOwnerSummoner ?? null;
-
-  for (const player of body.players ?? []) {
-    if (!player.isBot && player.isLeader) {
-      if (normalizeSummoner(player.summonerName) === reporter &&
-          isResolvableSummoner(body.connectedSummoner)) {
-        lobbyOwnerSummoner = body.connectedSummoner;
-      } else if (isResolvableSummoner(player.summonerName) &&
-        (!lobbyOwnerSummoner || !isResolvableSummoner(lobbyOwnerSummoner))) {
-        lobbyOwnerSummoner = player.summonerName;
-      }
-    }
-  }
+  const lobbyOwnerSummoner = mergeLobbyOwner(existing?.lobbyOwnerSummoner ?? null, body, reporter);
 
   for (const player of body.players ?? []) {
     if (player.isBot) continue;
@@ -188,11 +228,23 @@ function mergeLobbyReport(existing, body) {
 
   reconcileDualHumanSelfTeams(selfTeams, peerTeams, lobbyOwnerSummoner);
   const rosterSource = pickCanonicalRoster(existing, body, lobbyOwnerSummoner, reporter);
-  const players = rebuildPlayers(
-    rosterSource,
-    selfTeams,
-    peerTeams
+  const players = normalizePlayerLeadership(
+    rebuildPlayers(
+      rosterSource,
+      selfTeams,
+      peerTeams
+    ),
+    lobbyOwnerSummoner
   );
+
+  const { clientReports, validation } = recordClientReport(existing, {
+    ...body,
+    players,
+    connectedSummoner: body.connectedSummoner ?? body.ConnectedSummoner,
+    rosterSnapshotHash: body.rosterSnapshotHash,
+    clientVersion: body.clientVersion,
+    phase: body.phase ?? existing?.phase ?? 'Lobby'
+  });
 
   return {
     matchSessionId: body.matchSessionId ?? existing?.matchSessionId,
@@ -204,6 +256,8 @@ function mergeLobbyReport(existing, body) {
     players,
     selfTeams,
     peerTeams,
+    clientReports,
+    validation,
     updatedAt: now,
     expiresAt
   };
@@ -217,8 +271,9 @@ async function saveLobbyRecord(db, record) {
       `
       INSERT INTO active_lobbies (
         match_session_id, roster_key, game_mode, queue_id, phase,
-        lobby_owner_summoner, players, self_teams, peer_teams, updated_at, expires_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        lobby_owner_summoner, players, self_teams, peer_teams,
+        client_reports, validation, updated_at, expires_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       ON CONFLICT (match_session_id) DO UPDATE SET
         roster_key = EXCLUDED.roster_key,
         game_mode = EXCLUDED.game_mode,
@@ -228,6 +283,8 @@ async function saveLobbyRecord(db, record) {
         players = EXCLUDED.players,
         self_teams = EXCLUDED.self_teams,
         peer_teams = EXCLUDED.peer_teams,
+        client_reports = EXCLUDED.client_reports,
+        validation = EXCLUDED.validation,
         updated_at = EXCLUDED.updated_at,
         expires_at = EXCLUDED.expires_at
       `,
@@ -241,6 +298,8 @@ async function saveLobbyRecord(db, record) {
         JSON.stringify(record.players ?? []),
         JSON.stringify(record.selfTeams ?? {}),
         JSON.stringify(record.peerTeams ?? {}),
+        JSON.stringify(record.clientReports ?? {}),
+        record.validation ? JSON.stringify(record.validation) : null,
         record.updatedAt,
         record.expiresAt
       ]
@@ -255,6 +314,15 @@ async function saveLobbyRecord(db, record) {
   return record;
 }
 
+async function attachStakeLocks(db, lobby) {
+  if (!lobby?.matchSessionId) return lobby;
+  const locks = await listStakeLocks(db, lobby.matchSessionId);
+  return {
+    ...lobby,
+    stakeLocks: toPublicStakeLocks(locks)
+  };
+}
+
 async function getLobby(db, matchSessionId) {
   await ensureLobbySchema(db);
 
@@ -262,19 +330,22 @@ async function getLobby(db, matchSessionId) {
     const result = await db.pool.query(
       `
       SELECT match_session_id, roster_key, game_mode, queue_id, phase,
-             lobby_owner_summoner, players, self_teams, peer_teams, updated_at, expires_at
+             lobby_owner_summoner, players, self_teams, peer_teams,
+             client_reports, validation, updated_at, expires_at
       FROM active_lobbies
       WHERE match_session_id = $1
       `,
       [matchSessionId]
     );
     const lobby = mapLobbyRow(result.rows[0]);
-    return lobby && !isExpired(lobby) ? lobby : null;
+    if (!lobby || isExpired(lobby)) return null;
+    return attachStakeLocks(db, lobby);
   }
 
   const store = db.readStore();
   const lobby = mapLobbyRow(store.activeLobbies?.[matchSessionId]);
-  return lobby && !isExpired(lobby) ? lobby : null;
+  if (!lobby || isExpired(lobby)) return null;
+  return attachStakeLocks(db, lobby);
 }
 
 async function findLobbyByRosterKey(db, rosterKey) {
@@ -284,7 +355,8 @@ async function findLobbyByRosterKey(db, rosterKey) {
     const result = await db.pool.query(
       `
       SELECT match_session_id, roster_key, game_mode, queue_id, phase,
-             lobby_owner_summoner, players, self_teams, peer_teams, updated_at, expires_at
+             lobby_owner_summoner, players, self_teams, peer_teams,
+             client_reports, validation, updated_at, expires_at
       FROM active_lobbies
       WHERE roster_key = $1 AND expires_at > NOW()
       ORDER BY updated_at DESC
@@ -329,7 +401,8 @@ async function resolveLobby(db, body) {
     rosterKey
   });
 
-  return saveLobbyRecord(db, merged);
+  const saved = await saveLobbyRecord(db, merged);
+  return attachStakeLocks(db, saved);
 }
 
 async function deleteLobby(db, matchSessionId) {
@@ -363,6 +436,7 @@ function validateLobbySync(body) {
 
 module.exports = {
   computeRosterKey,
+  mergeLobbyOwner,
   resolveLobby,
   upsertLobby,
   getLobby,

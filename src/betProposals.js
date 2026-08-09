@@ -1,5 +1,52 @@
+const {
+  validateProposalAgainstLobby,
+  sanitizeProposalCreate
+} = require('./lobbyValidation');
+
 function normalizeSummoner(value) {
   return String(value ?? '').trim().toUpperCase();
+}
+
+function participantHasPendingResponse(proposal, normalizedSummoner) {
+  const required = (proposal.requiredParticipants ?? []).map(normalizeSummoner);
+  if (!required.includes(normalizedSummoner)) return false;
+  const response = (proposal.responses ?? []).find((r) => normalizeSummoner(r.summoner) === normalizedSummoner);
+  return !response;
+}
+
+function ensureParticipantIndex(store) {
+  if (!store.betProposalParticipantIndex) store.betProposalParticipantIndex = {};
+  return store.betProposalParticipantIndex;
+}
+
+function indexProposalParticipants(store, proposal) {
+  if (!proposal?.proposalId || proposal.status !== 'pending') return;
+  const index = ensureParticipantIndex(store);
+  for (const name of proposal.requiredParticipants ?? []) {
+    const key = normalizeSummoner(name);
+    if (!key) continue;
+    if (!index[key]) index[key] = [];
+    if (!index[key].includes(proposal.proposalId)) index[key].push(proposal.proposalId);
+  }
+}
+
+function removeProposalFromParticipantIndex(store, proposal) {
+  if (!proposal?.proposalId) return;
+  const index = store.betProposalParticipantIndex;
+  if (!index) return;
+  for (const name of proposal.requiredParticipants ?? []) {
+    const key = normalizeSummoner(name);
+    if (!key || !index[key]) continue;
+    index[key] = index[key].filter((id) => id !== proposal.proposalId);
+    if (index[key].length === 0) delete index[key];
+  }
+}
+
+function rebuildParticipantIndex(store) {
+  store.betProposalParticipantIndex = {};
+  for (const proposal of Object.values(store.betProposals ?? {})) {
+    if (proposal.status === 'pending') indexProposalParticipants(store, proposal);
+  }
 }
 
 function evaluateStatus(requiredParticipants, responses) {
@@ -58,6 +105,9 @@ async function ensureProposalSchema(db) {
       );
       CREATE INDEX IF NOT EXISTS idx_bet_proposals_match_session ON bet_proposals (match_session_id);
       CREATE INDEX IF NOT EXISTS idx_bet_proposals_status ON bet_proposals (status);
+      CREATE INDEX IF NOT EXISTS idx_bet_proposals_match_pending
+        ON bet_proposals (match_session_id, created_at DESC)
+        WHERE status = 'pending';
     `);
     return;
   }
@@ -70,19 +120,27 @@ async function ensureProposalSchema(db) {
 async function createProposal(db, body, options = {}) {
   await ensureProposalSchema(db);
 
+  const sanitized = sanitizeProposalCreate(body);
+  const errors = validateProposalCreate(sanitized);
+  if (errors.length > 0) {
+    const err = new Error(errors.join('; '));
+    err.code = 'VALIDATION';
+    throw err;
+  }
+
   if (options.getLobby) {
-    const lobby = await options.getLobby(db, body.matchSessionId);
-    if (lobby?.lobbyOwnerSummoner &&
-      normalizeSummoner(lobby.lobbyOwnerSummoner) !== normalizeSummoner(body.creatorSummoner)) {
-      const err = new Error('Only the lobby owner can create bet proposals');
-      err.code = 'NOT_LOBBY_OWNER';
+    const lobby = await options.getLobby(db, sanitized.matchSessionId);
+    const lobbyErrors = validateProposalAgainstLobby(lobby, sanitized);
+    if (lobbyErrors.length > 0) {
+      const err = new Error(lobbyErrors.join('; '));
+      err.code = lobbyErrors.some((e) => e.includes('owner')) ? 'NOT_LOBBY_OWNER' : 'VALIDATION';
       throw err;
     }
   }
 
-  const proposalId = body.proposalId || `bp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const requiredParticipants = (body.requiredParticipants ?? []).map((p) => String(p).trim());
-  const creator = String(body.creatorSummoner).trim();
+  const proposalId = sanitized.proposalId || `bp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const requiredParticipants = (sanitized.requiredParticipants ?? []).map((p) => String(p).trim());
+  const creator = String(sanitized.creatorSummoner).trim();
   const responses = [
     {
       summoner: creator,
@@ -95,13 +153,13 @@ async function createProposal(db, body, options = {}) {
 
   const record = {
     proposalId,
-    matchSessionId: body.matchSessionId,
+    matchSessionId: sanitized.matchSessionId,
     creatorSummoner: creator,
-    stakeAmount: Number(body.stakeAmount),
-    ruleType: body.ruleType,
-    pickedTeam: body.pickedTeam,
-    targetValue: Number(body.targetValue ?? 0),
-    stakeDescription: body.stakeDescription ?? null,
+    stakeAmount: Number(sanitized.stakeAmount),
+    ruleType: sanitized.ruleType,
+    pickedTeam: sanitized.pickedTeam,
+    targetValue: Number(sanitized.targetValue ?? 0),
+    stakeDescription: sanitized.stakeDescription ?? null,
     requiredParticipants,
     responses,
     status,
@@ -140,6 +198,7 @@ async function createProposal(db, body, options = {}) {
   const store = db.readStore();
   store.betProposals = store.betProposals ?? {};
   store.betProposals[proposalId] = record;
+  indexProposalParticipants(store, record);
   db.writeStore(store);
   return record;
 }
@@ -190,7 +249,10 @@ async function saveProposalRecord(db, record, options = {}) {
 
   const store = db.readStore();
   store.betProposals = store.betProposals ?? {};
+  const previous = store.betProposals[record.proposalId];
+  if (previous) removeProposalFromParticipantIndex(store, previous);
   store.betProposals[record.proposalId] = record;
+  if (record.status === 'pending') indexProposalParticipants(store, record);
   db.writeStore(store);
   return record;
 }
@@ -315,11 +377,11 @@ async function expireProposalsForMatch(db, matchSessionId) {
 async function getPendingInvitationForSummoner(db, summoner, matchSessionId = null) {
   await ensureProposalSchema(db);
   const normalized = normalizeSummoner(summoner);
+  if (!normalized) return null;
 
-  let proposals = [];
   if (db.mode === 'postgres') {
-    const result = matchSessionId
-      ? await db.pool.query(
+    if (matchSessionId) {
+      const result = await db.pool.query(
         `
         SELECT proposal_id, match_session_id, creator_summoner, stake_amount, rule_type,
                picked_team, target_value, stake_description, required_participants,
@@ -327,35 +389,52 @@ async function getPendingInvitationForSummoner(db, summoner, matchSessionId = nu
         FROM bet_proposals
         WHERE status = 'pending' AND match_session_id = $1
         ORDER BY created_at DESC
+        LIMIT 10
         `,
         [matchSessionId]
-      )
-      : await db.pool.query(
-        `
-        SELECT proposal_id, match_session_id, creator_summoner, stake_amount, rule_type,
-               picked_team, target_value, stake_description, required_participants,
-               responses, status, created_at, updated_at
-        FROM bet_proposals
-        WHERE status = 'pending'
-        ORDER BY created_at DESC
-        `
       );
-    proposals = result.rows.map(mapProposalRow);
-  } else {
-    const store = db.readStore();
-    proposals = Object.values(store.betProposals ?? {}).filter((p) => {
-      if (p.status !== 'pending') return false;
-      if (matchSessionId && p.matchSessionId !== matchSessionId) return false;
-      return true;
-    });
+      return result.rows.map(mapProposalRow).find((p) => participantHasPendingResponse(p, normalized)) ?? null;
+    }
+
+    const result = await db.pool.query(
+      `
+      SELECT proposal_id, match_session_id, creator_summoner, stake_amount, rule_type,
+             picked_team, target_value, stake_description, required_participants,
+             responses, status, created_at, updated_at
+      FROM bet_proposals
+      WHERE status = 'pending'
+        AND EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements_text(required_participants) AS elem
+          WHERE UPPER(TRIM(elem)) = $1
+        )
+      ORDER BY created_at DESC
+      LIMIT 5
+      `,
+      [normalized]
+    );
+    return result.rows.map(mapProposalRow).find((p) => participantHasPendingResponse(p, normalized)) ?? null;
   }
 
-  return proposals.find((proposal) => {
-    const required = (proposal.requiredParticipants ?? []).map(normalizeSummoner);
-    if (!required.includes(normalized)) return false;
-    const response = (proposal.responses ?? []).find((r) => normalizeSummoner(r.summoner) === normalized);
-    return !response;
-  }) ?? null;
+  const store = db.readStore();
+  if (!store.betProposalParticipantIndex && store.betProposals) rebuildParticipantIndex(store);
+
+  if (matchSessionId) {
+    const scoped = Object.values(store.betProposals ?? {}).filter((p) =>
+      p.status === 'pending' && p.matchSessionId === matchSessionId);
+    const found = scoped.find((p) => participantHasPendingResponse(p, normalized));
+    if (found) return found;
+  }
+
+  const proposalIds = store.betProposalParticipantIndex?.[normalized] ?? [];
+  for (const proposalId of proposalIds) {
+    const proposal = store.betProposals?.[proposalId];
+    if (proposal?.status === 'pending' && participantHasPendingResponse(proposal, normalized)) {
+      return proposal;
+    }
+  }
+
+  return null;
 }
 
 function validateProposalCreate(body) {
@@ -369,6 +448,9 @@ function validateProposalCreate(body) {
   if (!Array.isArray(body.requiredParticipants) || body.requiredParticipants.length === 0) {
     errors.push('requiredParticipants must be a non-empty array');
   }
+  if (body.requiredParticipants?.length > 20) {
+    errors.push('requiredParticipants exceeds maximum of 20');
+  }
   return errors;
 }
 
@@ -380,5 +462,7 @@ module.exports = {
   getPendingInvitationForSummoner,
   cancelProposal,
   expireProposalsForMatch,
-  validateProposalCreate
+  validateProposalCreate,
+  sanitizeProposalCreate,
+  validateProposalAgainstLobby
 };

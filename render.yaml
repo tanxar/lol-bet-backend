@@ -9,5 +9,9 @@ services:
     envVars:
       - key: HOST
         value: 0.0.0.0
-      - key: API_KEY
+      - key: CLIENT_API_KEY
+        sync: false
+      - key: WALLET_ENCRYPTION_KEY
+        sync: false
+      - key: TRONGRID_API_KEY
         sync: false

@@ -1,4 +1,4 @@
-function readJsonBody(req) {
+function readRawBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
@@ -15,20 +15,42 @@ function readJsonBody(req) {
     });
 
     req.on('end', () => {
-      if (chunks.length === 0) {
-        resolve(null);
-        return;
-      }
-
-      try {
-        const text = Buffer.concat(chunks).toString('utf8');
-        resolve(JSON.parse(text));
-      } catch {
-        reject(new Error('Invalid JSON'));
-      }
+      resolve(chunks.length === 0 ? Buffer.alloc(0) : Buffer.concat(chunks));
     });
 
     req.on('error', reject);
+  });
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    if (req._rawBody !== undefined) {
+      if (req._rawBody.length === 0) {
+        resolve(null);
+        return;
+      }
+      try {
+        resolve(JSON.parse(req._rawBody.toString('utf8')));
+      } catch {
+        reject(new Error('Invalid JSON'));
+      }
+      return;
+    }
+
+    readRawBody(req)
+      .then((raw) => {
+        req._rawBody = raw;
+        if (raw.length === 0) {
+          resolve(null);
+          return;
+        }
+        try {
+          resolve(JSON.parse(raw.toString('utf8')));
+        } catch {
+          reject(new Error('Invalid JSON'));
+        }
+      })
+      .catch(reject);
   });
 }
 
@@ -63,6 +85,7 @@ function sendFile(res, statusCode, filePath, contentType) {
 
 module.exports = {
   readJsonBody,
+  readRawBody,
   sendJson,
   parseUrl,
   sendFile

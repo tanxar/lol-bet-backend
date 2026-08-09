@@ -1,6 +1,8 @@
 const fs = require('fs');
 const path = require('path');
 
+const { mergeMatchPayload } = require('./matchOutcomeValidation');
+
 function openJsonDatabase(dataDir) {
   const resolved = path.resolve(dataDir);
   fs.mkdirSync(resolved, { recursive: true });
@@ -64,6 +66,9 @@ async function openPostgresDatabase(databaseUrl) {
     CREATE INDEX IF NOT EXISTS idx_matches_completed ON matches (end_time) WHERE end_time IS NOT NULL;
   `);
 
+  await pool.query(`ALTER TABLE matches ADD COLUMN IF NOT EXISTS blue_score INTEGER;`);
+  await pool.query(`ALTER TABLE matches ADD COLUMN IF NOT EXISTS red_score INTEGER;`);
+
   return { mode: 'postgres', pool };
 }
 
@@ -96,6 +101,8 @@ function buildSummary(report, receivedAt) {
     playerOutcome: report.playerOutcome ?? null,
     winnerTeam: report.winnerTeam ?? null,
     connectedSummoner: report.connectedSummoner ?? null,
+    blueScore: report.blueScore ?? null,
+    redScore: report.redScore ?? null,
     clientVersion: report.clientVersion,
     reportedAt: report.reportedAt ?? receivedAt,
     receivedAt
@@ -104,18 +111,21 @@ function buildSummary(report, receivedAt) {
 
 async function saveMatch(db, report) {
   const receivedAt = new Date().toISOString();
-  const players = buildPlayers(report);
-  const summary = buildSummary(report, receivedAt);
+  const existing = await getMatch(db, report.matchSessionId);
+  const mergedReport = mergeMatchPayload(existing, report);
+  const players = buildPlayers(mergedReport);
+  const summary = buildSummary(mergedReport, receivedAt);
+  summary.outcomeValidation = mergedReport.outcomeValidation ?? null;
 
   if (db.mode === 'postgres') {
     await db.pool.query(
       `
       INSERT INTO matches (
         match_session_id, game_mode, start_time, end_time, player_outcome,
-        winner_team, connected_summoner, client_version, reported_at,
+        winner_team, connected_summoner, blue_score, red_score, client_version, reported_at,
         received_at, bet_json, players_json, payload_json
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
       )
       ON CONFLICT (match_session_id) DO UPDATE SET
         game_mode = EXCLUDED.game_mode,
@@ -124,6 +134,8 @@ async function saveMatch(db, report) {
         player_outcome = COALESCE(EXCLUDED.player_outcome, matches.player_outcome),
         winner_team = COALESCE(EXCLUDED.winner_team, matches.winner_team),
         connected_summoner = COALESCE(EXCLUDED.connected_summoner, matches.connected_summoner),
+        blue_score = COALESCE(EXCLUDED.blue_score, matches.blue_score),
+        red_score = COALESCE(EXCLUDED.red_score, matches.red_score),
         client_version = EXCLUDED.client_version,
         reported_at = EXCLUDED.reported_at,
         received_at = EXCLUDED.received_at,
@@ -132,32 +144,35 @@ async function saveMatch(db, report) {
         payload_json = EXCLUDED.payload_json
       `,
       [
-        report.matchSessionId,
-        report.gameMode,
-        report.startTime,
-        report.endTime ?? null,
-        report.playerOutcome ?? null,
-        report.winnerTeam ?? null,
-        report.connectedSummoner ?? null,
-        report.clientVersion,
-        report.reportedAt ?? receivedAt,
+        mergedReport.matchSessionId,
+        mergedReport.gameMode,
+        mergedReport.startTime,
+        mergedReport.endTime ?? null,
+        mergedReport.playerOutcome ?? null,
+        mergedReport.winnerTeam ?? null,
+        mergedReport.connectedSummoner ?? null,
+        mergedReport.blueScore ?? null,
+        mergedReport.redScore ?? null,
+        mergedReport.clientVersion,
+        mergedReport.reportedAt ?? receivedAt,
         receivedAt,
-        report.bet ? JSON.stringify(report.bet) : null,
+        mergedReport.bet ? JSON.stringify(mergedReport.bet) : null,
         JSON.stringify(players),
-        JSON.stringify(report)
+        JSON.stringify(mergedReport)
       ]
     );
-    return;
+    return mergedReport.outcomeValidation ?? null;
   }
 
   const store = db.readStore();
-  store.matches[report.matchSessionId] = {
+  store.matches[mergedReport.matchSessionId] = {
     summary,
     players,
-    bet: report.bet ?? null,
-    payload: report
+    bet: mergedReport.bet ?? null,
+    payload: mergedReport
   };
   db.writeStore(store);
+  return mergedReport.outcomeValidation ?? null;
 }
 
 async function listMatches(db, { limit = 50, offset = 0, completedOnly = false, summoner = null } = {}) {
@@ -192,6 +207,8 @@ async function listMatches(db, { limit = 50, offset = 0, completedOnly = false, 
         player_outcome AS "playerOutcome",
         winner_team AS "winnerTeam",
         connected_summoner AS "connectedSummoner",
+        blue_score AS "blueScore",
+        red_score AS "redScore",
         client_version AS "clientVersion",
         reported_at AS "reportedAt",
         received_at AS "receivedAt",
@@ -212,6 +229,8 @@ async function listMatches(db, { limit = 50, offset = 0, completedOnly = false, 
       playerOutcome: row.playerOutcome,
       winnerTeam: row.winnerTeam,
       connectedSummoner: row.connectedSummoner,
+      blueScore: row.blueScore,
+      redScore: row.redScore,
       clientVersion: row.clientVersion,
       reportedAt: row.reportedAt?.toISOString?.() ?? row.reportedAt,
       receivedAt: row.receivedAt?.toISOString?.() ?? row.receivedAt,
